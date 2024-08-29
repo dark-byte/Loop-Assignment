@@ -1,7 +1,8 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import pandas as pd
 import pytz
+import mysql.connector
 from app.models import connect_to_database
 
 # Define the directory to save the CSV files
@@ -11,161 +12,144 @@ REPORTS_DIRECTORY = 'reports/'
 os.makedirs(REPORTS_DIRECTORY, exist_ok=True)
 
 def create_report(report_id):
-    """
-    Function to create a report for uptime and downtime calculation and update the status in the database.
-    """
-    try:
-        # Connect to the database
-        conn = connect_to_database()
-        cursor = conn.cursor(dictionary=True)
+    # Connect to the database using mysql.connector
+    connection = connect_to_database()
+    cursor = connection.cursor(dictionary=True)  # Use dictionary cursor to fetch rows as dictionaries
 
+    try:
         # Fetch data from the database
-        cursor.execute("SELECT store_id, timestamp_utc, status FROM store_status")
-        status_data = cursor.fetchall()
-        
         cursor.execute("SELECT store_id, day_of_week, start_time_local, end_time_local FROM business_hours")
         business_hours_data = cursor.fetchall()
-        
-        cursor.execute("SELECT store_id, timezone_str FROM store_timezone")
-        timezone_data = cursor.fetchall()
-
-        # Convert data to pandas DataFrames
-        status_df = pd.DataFrame(status_data)
         business_hours_df = pd.DataFrame(business_hours_data)
-        timezone_df = pd.DataFrame(timezone_data)
 
-        # Log the raw data to inspect for invalid datetime values
-        print(f"Raw status data: {status_df.head()}")
+        cursor.execute("SELECT store_id, timestamp_utc, status FROM store_status")
+        store_status_data = cursor.fetchall()
+        store_status_df = pd.DataFrame(store_status_data)
 
-        # Handle datetime conversion with error coercion
-        status_df['timestamp_utc'] = pd.to_datetime(status_df['timestamp_utc'], errors='coerce')
+        cursor.execute("SELECT store_id, timezone_str FROM store_timezone")
+        store_timezone_data = cursor.fetchall()
+        store_timezone_df = pd.DataFrame(store_timezone_data)
 
-        # Identify any rows that still have out-of-bounds or missing dates
-        invalid_dates = status_df[status_df['timestamp_utc'].isna()]
-        if not invalid_dates.empty:
-            print(f"Invalid or out-of-bounds datetime entries found: {invalid_dates}")
+        # Convert 'start_time_local' and 'end_time_local' to proper datetime objects using 'day_of_week'
+        def convert_to_datetime(row):
+            # Get the current week start (Monday)
+            current_date = datetime.now()
+            week_start = current_date - timedelta(days=current_date.weekday())  # Start of the week (Monday)
+            # Compute the specific date for the given 'day_of_week'
+            target_date = week_start + timedelta(days=row['day_of_week'])
 
-        # Remove rows with invalid or NaT datetime values
-        status_df.dropna(subset=['timestamp_utc'], inplace=True)
+            # Convert 'start_time_local' and 'end_time_local' from Timedelta to time
+            start_time = (pd.to_timedelta(row['start_time_local']).components.hours, 
+                          pd.to_timedelta(row['start_time_local']).components.minutes,
+                          pd.to_timedelta(row['start_time_local']).components.seconds)
+            
+            end_time = (pd.to_timedelta(row['end_time_local']).components.hours, 
+                        pd.to_timedelta(row['end_time_local']).components.minutes,
+                        pd.to_timedelta(row['end_time_local']).components.seconds)
 
-        # Determine the max timestamp to use as the current time
-        max_timestamp = status_df['timestamp_utc'].max()
-        current_time = pd.to_datetime(max_timestamp)
+            # Combine the date with the start and end times
+            start_datetime = datetime.combine(target_date, time(start_time[0], start_time[1], start_time[2]))
+            end_datetime = datetime.combine(target_date, time(end_time[0], end_time[1], end_time[2]))
+            
+            return pd.Series({'start_time_local': start_datetime, 'end_time_local': end_datetime})
 
-        # Merge the data for further processing
-        merged_df = status_df.merge(timezone_df, on='store_id', how='left')
-        merged_df = merged_df.merge(business_hours_df, on='store_id', how='left')
+        business_hours_df[['start_time_local', 'end_time_local']] = business_hours_df.apply(convert_to_datetime, axis=1)
 
-        # Fix the FutureWarning by using the suggested approach
-        merged_df['timezone_str'] = merged_df['timezone_str'].fillna('America/Chicago')
+        # Convert timestamp_utc to local timezone for each store
+        store_status_df = store_status_df.merge(store_timezone_df, on='store_id')
+        store_status_df['timestamp_local'] = store_status_df.apply(
+            lambda row: pd.to_datetime(row['timestamp_utc']).tz_localize('UTC').astimezone(pytz.timezone(row['timezone_str'])),
+            axis=1
+        )
 
-        # Convert timestamps to local time for each store
-        merged_df['local_time'] = merged_df.apply(lambda row: convert_to_local_time(row['timestamp_utc'], row['timezone_str']), axis=1)
-
-        # Calculate uptime and downtime
+        # Initialize an empty list to hold report data
         report_data = []
-        for store_id, group in merged_df.groupby('store_id'):
-            report_entry = calculate_uptime_downtime(store_id, group, current_time)
-            report_data.append(report_entry)
 
-        # Convert the report to a DataFrame
+        # Process each store
+        for store_id, group in store_status_df.groupby('store_id'):
+            # Get store business hours
+            store_hours = business_hours_df[business_hours_df['store_id'] == store_id]
+            if store_hours.empty:
+                continue
+
+            # Calculate uptime and downtime for each period
+            uptime_last_hour = uptime_last_day = uptime_last_week = 0
+            downtime_last_hour = downtime_last_day = downtime_last_week = 0
+
+            now = datetime.now(pytz.utc)
+
+            # Convert business hours to local timezone
+            for _, hours in store_hours.iterrows():
+                local_timezone = pytz.timezone(store_timezone_df.loc[store_timezone_df['store_id'] == store_id, 'timezone_str'].values[0])
+                start_time_local = local_timezone.localize(hours['start_time_local'])
+                end_time_local = local_timezone.localize(hours['end_time_local'])
+
+                # Get observations within business hours
+                within_business_hours = group[(group['timestamp_local'] >= start_time_local) & (group['timestamp_local'] <= end_time_local)]
+
+                # Calculate uptime and downtime based on observations
+                for period, duration in [('hour', 60), ('day', 1440), ('week', 10080)]:
+                    end_time = now
+                    start_time = now - timedelta(minutes=duration)
+
+                    period_data = within_business_hours[(within_business_hours['timestamp_local'] >= start_time) & (within_business_hours['timestamp_local'] <= end_time)]
+                    
+                    if not period_data.empty:
+                        active_periods = period_data[period_data['status'] == 'active']
+                        inactive_periods = period_data[period_data['status'] == 'inactive']
+
+                        # Interpolation logic: assume uptime or downtime between observations
+                        total_minutes = (end_time - start_time).total_seconds() / 60
+                        observed_minutes = len(active_periods) * 1  # Assuming each observation represents 1 minute
+                        uptime = observed_minutes / total_minutes * duration
+                        downtime = duration - uptime
+
+                        # Assign values to respective periods
+                        if period == 'hour':
+                            uptime_last_hour = uptime
+                            downtime_last_hour = downtime
+                        elif period == 'day':
+                            uptime_last_day = uptime / 60
+                            downtime_last_day = downtime / 60
+                        elif period == 'week':
+                            uptime_last_week = uptime / 60
+                            downtime_last_week = downtime / 60
+
+            # Append the store report data
+            report_data.append({
+                'store_id': store_id,
+                'uptime_last_hour': uptime_last_hour,
+                'uptime_last_day': uptime_last_day,
+                'uptime_last_week': uptime_last_week,
+                'downtime_last_hour': downtime_last_hour,
+                'downtime_last_day': downtime_last_day,
+                'downtime_last_week': downtime_last_week
+            })
+
+        # Create a DataFrame for the report
         report_df = pd.DataFrame(report_data)
 
-        # Convert the report DataFrame to CSV format
-        report_csv = report_df.to_csv(index=False)
+        # Save the report to a CSV file
+        report_filename = os.path.join(REPORTS_DIRECTORY, f'report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv')
+        report_df.to_csv(report_filename, index=False)
 
-        # Save the CSV to a file
-        csv_filename = os.path.join(REPORTS_DIRECTORY, f'report_{report_id}.csv')
-        with open(csv_filename, 'w') as csv_file:
-            csv_file.write(report_csv)
+        # Read CSV file content for update
+        with open(report_filename, 'r') as file:
+            report_csv = file.read()
 
         # Update the report status in the database with the CSV file content
         cursor.execute("UPDATE reports SET status = %s, report_data = %s WHERE report_id = %s", ('Complete', report_csv, report_id))
-        conn.commit()
-    
+        connection.commit()
+
+        print(f"Report generated and saved to {report_filename}")
+
     except Exception as e:
-        print(f"Error generating report: {e}")
-        # Update the status to 'Failed' in case of any error
+        # Update the report status in the database to 'Failed'
         cursor.execute("UPDATE reports SET status = %s WHERE report_id = %s", ('Failed', report_id))
-        conn.commit()
-    
+        connection.commit()
+        print(f"Failed to generate report: {e}")
+
     finally:
+        # Close the cursor and connection
         cursor.close()
-        conn.close()
-
-def convert_to_local_time(utc_time_str, timezone_str):
-    """
-    Convert UTC time to the local time for the given timezone.
-    """
-    try:
-        utc_time = pd.to_datetime(utc_time_str, errors='coerce')
-        if pd.isna(utc_time):
-            return None
-        local_tz = pytz.timezone(timezone_str)
-        local_time = utc_time.tz_localize('UTC').astimezone(local_tz)
-        return local_time
-    except Exception as e:
-        print(f"Error converting time: {e}")
-        return None
-
-def calculate_uptime_downtime(store_id, store_data, current_time):
-    """
-    Calculate the uptime and downtime for a given store within business hours.
-    """
-    # Filter business hours for the store
-    business_hours = store_data.drop_duplicates(subset=['store_id', 'day_of_week', 'start_time_local', 'end_time_local'])
-
-    # Prepare to calculate uptime and downtime
-    total_minutes = timedelta(hours=0)
-    uptime_minutes_last_hour = 0
-    downtime_minutes_last_hour = 0
-    uptime_hours_last_day = 0
-    downtime_hours_last_day = 0
-    uptime_hours_last_week = 0
-    downtime_hours_last_week = 0
-
-    # Iterate over each day of business hours
-    for _, hours_row in business_hours.iterrows():
-        day_of_week = hours_row['day_of_week']
-        start_time_local = pd.to_datetime(hours_row['start_time_local']).time()
-        end_time_local = pd.to_datetime(hours_row['end_time_local']).time()
-
-        # Filter the data for observations within this day
-        observations = store_data[(store_data['day_of_week'] == day_of_week)]
-
-        # Iterate over the observations to calculate uptime and downtime
-        for _, obs in observations.iterrows():
-            obs_time = obs['local_time'].time()
-            status = obs['status']
-
-            # Check if observation falls within business hours
-            if start_time_local <= obs_time <= end_time_local:
-                # Logic to calculate uptime and downtime within business hours
-                if status == 'active':
-                    uptime_minutes_last_hour += calculate_minutes(obs_time, start_time_local, end_time_local)
-                else:
-                    downtime_minutes_last_hour += calculate_minutes(obs_time, start_time_local, end_time_local)
-
-    # Summarize all calculations to create the report entry
-    report_entry = {
-        'store_id': store_id,
-        'uptime_last_hour': uptime_minutes_last_hour,
-        'uptime_last_day': uptime_hours_last_day,
-        'uptime_last_week': uptime_hours_last_week,
-        'downtime_last_hour': downtime_minutes_last_hour,
-        'downtime_last_day': downtime_hours_last_day,
-        'downtime_last_week': downtime_hours_last_week
-    }
-
-    return report_entry
-
-def calculate_minutes(obs_time, start_time, end_time):
-    """
-    Helper function to calculate the minutes of uptime or downtime.
-    """
-    if obs_time < start_time:
-        return 0
-    elif obs_time > end_time:
-        return 0
-    else:
-        return (datetime.combine(datetime.min, end_time) - datetime.combine(datetime.min, obs_time)).seconds / 60
+        connection.close()

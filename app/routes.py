@@ -50,8 +50,8 @@ def get_report():
 
     status, report_data = result
 
-    if status == 'Running':
-        return jsonify({"status": "Running"})
+    if status == 'Running' or 'Failed':
+        return jsonify({"status": status})
 
     output = io.BytesIO(report_data.encode('utf-8'))
     output.seek(0)
